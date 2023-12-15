@@ -47,6 +47,7 @@ import (
 	apisv1alpha1 "github.com/crossplane-contrib/provider-kubernetes/apis/v1alpha1"
 	"github.com/crossplane-contrib/provider-kubernetes/internal/clients"
 	"github.com/crossplane-contrib/provider-kubernetes/internal/clients/gke"
+	"github.com/crossplane-contrib/provider-kubernetes/internal/clients/azure"
 )
 
 const (
@@ -63,6 +64,8 @@ const (
 	errFailedToCreateRestConfig         = "cannot create new REST config using provider secret"
 	errFailedToExtractGoogleCredentials = "cannot extract Google Application Credentials"
 	errFailedToInjectGoogleCredentials  = "cannot wrap REST client with Google Application Credentials"
+	errFailedToExtractAzureCredentials  = "failed to extract Azure Application Credentials"
+	errFailedToInjectAzureCredentials   = "failed to wrap REST client with Azure Application Credentials"
 
 	errGetLastApplied          = "cannot get last applied"
 	errUnmarshalTemplate       = "cannot unmarshal template"
@@ -99,6 +102,8 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 			kcfgExtractorFn: resource.CommonCredentialExtractor,
 			gcpExtractorFn:  resource.CommonCredentialExtractor,
 			gcpInjectorFn:   gke.WrapRESTConfig,
+			azureExtractorFn: resource.CommonCredentialExtractor,
+			azureInjectorFn:  azure.WrapRESTConfig,
 			newRESTConfigFn: clients.NewRESTConfig,
 			newKubeClientFn: clients.NewKubeClient,
 		}),
@@ -123,6 +128,8 @@ type connector struct {
 	kcfgExtractorFn func(ctx context.Context, src xpv1.CredentialsSource, c client.Client, ccs xpv1.CommonCredentialSelectors) ([]byte, error)
 	gcpExtractorFn  func(ctx context.Context, src xpv1.CredentialsSource, c client.Client, ccs xpv1.CommonCredentialSelectors) ([]byte, error)
 	gcpInjectorFn   func(ctx context.Context, rc *rest.Config, credentials []byte, scopes ...string) error
+	azureExtractorFn func(ctx context.Context, src xpv1.CredentialsSource, c client.Client, ccs xpv1.CommonCredentialSelectors) ([]byte, error)
+	azureInjectorFn  func(ctx context.Context, rc *rest.Config, credentials []byte, scopes ...string) error
 	newRESTConfigFn func(kubeconfig []byte) (*rest.Config, error)
 	newKubeClientFn func(config *rest.Config) (client.Client, error)
 }
@@ -169,14 +176,42 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	// time of writing there's only one valid value (Google App Creds), and
 	// that value is required.
 	if id := pc.Spec.Identity; id != nil {
-		creds, err := c.gcpExtractorFn(ctx, id.Source, c.kube, id.CommonCredentialSelectors)
-		if err != nil {
-			return nil, errors.Wrap(err, errFailedToExtractGoogleCredentials)
+		switch id.Type {
+		case apisv1alpha1.IdentityTypeGoogleApplicationCredentials:
+			switch id.Source {
+			case xpv1.CredentialsSourceInjectedIdentity:
+				if err := c.gcpInjectorFn(ctx, rc, nil, gke.DefaultScopes...); err != nil {
+					return nil, errors.Wrap(err, errFailedToInjectGoogleCredentials)
+				}
+			default:
+				creds, err := c.gcpExtractorFn(ctx, id.Source, c.kube, id.CommonCredentialSelectors)
+				if err != nil {
+					return nil, errors.Wrap(err, errFailedToExtractGoogleCredentials)
+				}
+
+				if err := c.gcpInjectorFn(ctx, rc, creds, gke.DefaultScopes...); err != nil {
+					return nil, errors.Wrap(err, errFailedToInjectGoogleCredentials)
+				}
+			}
+		case apisv1alpha1.IdentityTypeAzureServicePrincipalCredentials:
+			switch id.Source {
+			case xpv1.CredentialsSourceInjectedIdentity:
+				return nil, errors.Errorf("%s is not supported as identity source for identity type %s",
+				xpv1.CredentialsSourceInjectedIdentity, apisv1alpha1.IdentityTypeAzureServicePrincipalCredentials)
+			default:
+				creds, err := c.azureExtractorFn(ctx, id.Source, c.kube, id.CommonCredentialSelectors)
+				if err != nil {
+					return nil, errors.Wrap(err, errFailedToExtractAzureCredentials)
+				}
+
+				if err := c.azureInjectorFn(ctx, rc, creds); err != nil {
+					return nil, errors.Wrap(err, errFailedToInjectAzureCredentials)
+				}
+			}
+		default:
+			return nil, errors.Errorf("unknown identity type: %s", id.Type)
 		}
 
-		if err := c.gcpInjectorFn(ctx, rc, creds, gke.DefaultScopes...); err != nil {
-			return nil, errors.Wrap(err, errFailedToInjectGoogleCredentials)
-		}
 	}
 
 	k, err := c.newKubeClientFn(rc)
